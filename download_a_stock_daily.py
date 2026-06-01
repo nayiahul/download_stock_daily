@@ -162,10 +162,21 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ---- 过滤：只保留 3、0、6 开头的证券代码 ----
+    valid_prefixes = {"3", "0", "6"}
+    filtered_codes = []
+    skipped_prefix = 0
+    for code in stocks.证券代码:
+        code6 = str(code).strip().zfill(6)
+        if code6[0] not in valid_prefixes:
+            skipped_prefix += 1
+        else:
+            filtered_codes.append(code)
+
     # ---- 过滤已存在的文件 ----
     todo = []
     skipped_exist = 0
-    for code in stocks.证券代码:
+    for code in filtered_codes:
         code6 = str(code).strip().zfill(6)
         if SKIP_EXISTING and (OUTPUT_DIR / f"{code6}.csv").exists():
             skipped_exist += 1
@@ -173,7 +184,7 @@ def main():
             todo.append(code)
 
     total = len(stocks)
-    print(f"总数:{total}  已存在跳过:{skipped_exist}  待下载:{len(todo)}")
+    print(f"总数:{total}  非3/0/6开头跳过:{skipped_prefix}  已存在跳过:{skipped_exist}  待下载:{len(todo)}")
     print(f"并行:{MAX_WORKERS}进程  每批:{BATCH_SIZE}只  超时:{STOCK_TIMEOUT}s")
     print(f"批次暂停:{RESTART_SLEEP}s\n")
 
@@ -215,6 +226,7 @@ def main():
     print("\n" + "=" * 50)
     print(f"完成！耗时 {duration:.1f}s ({duration/60:.1f}min)")
     print(f"总数: {total}")
+    print(f"非3/0/6开头跳过: {skipped_prefix}")
     print(f"成功下载: {success}")
     print(f"已存在跳过: {skipped_exist}")
     print(f"失败/超时: {len(all_failed)}")
