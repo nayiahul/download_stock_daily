@@ -20,10 +20,10 @@ OUTPUT_DIR = Path("/Users/nayiahlu/Desktop/stocks")
 START_DATE = "2021-01-01"
 END_DATE = time.strftime("%Y-%m-%d")
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
-MAX_WORKERS = 3         # 并行进程数
+MAX_WORKERS = 6         # 并行进程数
 BATCH_SIZE = 200        # 每批数量，完成后重启连接池
 STOCK_TIMEOUT = 30      # 单只超时秒数，超时直接 SIGKILL
-RESTART_SLEEP = 10      # 批次间暂停秒数
+RESTART_SLEEP = 3       # 批次间暂停秒数
 
 FIELDS = [
     "date", "code", "open", "high", "low", "close", "preclose",
@@ -74,7 +74,7 @@ def download_one(code, output_dir, start_date, end_date, fields):
     filepath = Path(output_dir) / f"{code6}.csv"
     is_update = filepath.exists()
 
-    time.sleep(random.uniform(0, 1.5))
+    time.sleep(random.uniform(0, 0.3))
 
     lg = bs.login()
     if lg.error_code != "0":
