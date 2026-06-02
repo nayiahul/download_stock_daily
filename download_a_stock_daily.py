@@ -2,11 +2,16 @@
 批量下载A股日K线行情数据（前复权），一个代码一个CSV文件。
 数据源：baostock，股票列表：akshare。
 手动进程池 + 真超时kill，分批重启。
-支持增量更新：根据manifest.json中的行情截止日，只下载截止日之后的数据。
+
+模式:
+  python download_a_stock_daily.py            # 普通模式：从akshare取股票列表，新下载+增量更新
+  python download_a_stock_daily.py --sync     # 同步模式：扫描所有CSV文件最新日期，补齐缺失
+  python download_a_stock_daily.py --retry-failed  # 重试模式：重试failed_codes.txt中的失败项
 """
 
 import akshare as ak
 import multiprocessing
+import sys
 import time
 from time import perf_counter
 from pathlib import Path
@@ -64,8 +69,31 @@ def get_csv_info(filepath):
         return None, 0
 
 
-def download_one(code, output_dir, start_date, end_date, fields):
-    """子进程入口。文件不存在→全量下载；存在→增量合并。"""
+def _read_existing_stats(filepath):
+    """读取已有CSV的最后交易日和记录数。"""
+    try:
+        old_df = pd.read_csv(filepath, encoding="gbk", dtype=str)
+        return old_df["date"].max(), len(old_df)
+    except Exception:
+        return None, 0
+
+
+def _try_query(bs_code, fields, start_date, end_date):
+    """尝试查询baostock，返回data_list。空列表=无数据。"""
+    import baostock as bs
+    rs = bs.query_history_k_data_plus(
+        bs_code, ",".join(fields),
+        start_date=start_date, end_date=end_date,
+        frequency="d", adjustflag="2",
+    )
+    data_list = []
+    while (rs.error_code == "0") and rs.next():
+        data_list.append(rs.get_row_data())
+    return data_list
+
+
+def download_one(code, output_dir, start_date, end_date, fields, result_queue):
+    """子进程入口。下载数据写CSV，通过Queue返回 (code6, last_date, records, error)。"""
     import baostock as bs
     import random
 
@@ -74,24 +102,35 @@ def download_one(code, output_dir, start_date, end_date, fields):
     filepath = Path(output_dir) / f"{code6}.csv"
     is_update = filepath.exists()
 
-    time.sleep(random.uniform(0, 0.3))
+    time.sleep(random.uniform(0, 0.5))
 
-    lg = bs.login()
-    if lg.error_code != "0":
+    # 登录（重试1次）
+    for attempt in range(2):
+        lg = bs.login()
+        if lg.error_code == "0":
+            break
+        if attempt == 0:
+            time.sleep(random.uniform(1, 3))
+    else:
+        result_queue.put((code6, None, 0, "登录失败"))
         return
 
     try:
-        rs = bs.query_history_k_data_plus(
-            bs_code, ",".join(fields),
-            start_date=start_date, end_date=end_date,
-            frequency="d", adjustflag="2",
-        )
+        data_list = _try_query(bs_code, fields, start_date, end_date)
 
-        data_list = []
-        while (rs.error_code == "0") and rs.next():
-            data_list.append(rs.get_row_data())
+        # 增量更新返回空：可能是限流，退避重试1次
+        if not data_list and is_update:
+            time.sleep(random.uniform(2, 5))
+            data_list = _try_query(bs_code, fields, start_date, end_date)
 
         if not data_list:
+            if is_update:
+                # 已有CSV数据完好，无新数据不算失败
+                last_date, records = _read_existing_stats(filepath)
+                result_queue.put((code6, last_date, records, ""))
+            else:
+                # 新下载确实无数据
+                result_queue.put((code6, None, 0, "无数据"))
             return
 
         new_df = pd.DataFrame(data_list, columns=fields)
@@ -100,25 +139,30 @@ def download_one(code, output_dir, start_date, end_date, fields):
             try:
                 old_df = pd.read_csv(filepath, encoding="gbk", dtype=str)
             except Exception:
-                # 文件损坏，按全量处理
                 new_df.to_csv(filepath, encoding="gbk", index=False)
+                result_queue.put((code6, new_df["date"].max(), len(new_df), ""))
                 return
 
             merged = pd.concat([old_df, new_df], ignore_index=True)
             merged = merged.drop_duplicates(subset=["date"], keep="last")
             merged = merged.sort_values("date")
             merged.to_csv(filepath, encoding="gbk", index=False)
+            result_queue.put((code6, merged["date"].max(), len(merged), ""))
         else:
             new_df.to_csv(filepath, encoding="gbk", index=False)
+            result_queue.put((code6, new_df["date"].max(), len(new_df), ""))
+    except Exception as e:
+        result_queue.put((code6, None, 0, str(e)))
     finally:
         bs.logout()
 
 
-def process_batch(batch, output_dir, fields):
-    """处理一批股票。batch: [(code, start_date), ...]。返回 (success, failed_list)。"""
+def process_batch(batch, output_dir, fields, max_workers=MAX_WORKERS, stock_timeout=STOCK_TIMEOUT):
+    """处理一批股票。batch: [(code, start_date), ...]。返回 (results, failed_list)。"""
     ctx = multiprocessing.get_context("spawn")
-    running = {}   # pid -> (process, code, start_time)
-    success = 0
+    result_queue = ctx.Queue()
+    running = {}
+    results = []
     failed = []
     code_iter = iter(batch)
     done_count = 0
@@ -127,68 +171,65 @@ def process_batch(batch, output_dir, fields):
     def start_worker(code, start_date):
         p = ctx.Process(
             target=download_one,
-            args=(code, output_dir, start_date, END_DATE, fields),
+            args=(code, output_dir, start_date, END_DATE, fields, result_queue),
         )
         p.start()
         running[p.pid] = (p, code, perf_counter())
 
-    def reap_worker(pid, timed_out=False):
-        nonlocal success, done_count
-        p, code, _start = running.pop(pid)
-        code6 = str(code).strip().zfill(6)
-
-        if timed_out:
-            p.kill()
-            reason = f"超时{STOCK_TIMEOUT}s"
-        else:
-            reason = "异常退出" if p.exitcode != 0 else ""
-
-        p.join(timeout=5)
-        if p.is_alive():
-            p.kill()
-            p.join()
-
-        if not timed_out and not reason:
-            if (Path(output_dir) / f"{code6}.csv").exists():
-                success += 1
-            else:
-                reason = "无数据"
-
-        if reason:
-            failed.append((code6, reason))
-
-        done_count += 1
-        elapsed = perf_counter() - batch_start
-        rate = done_count / elapsed if elapsed > 0 else 0
-        eta = (total - done_count) / rate if rate > 0 else 0
-        print(f"\r  [{done_count}/{total}] "
-              f"成功:{success} 失败:{len(failed)}  "
-              f"{rate:.2f}只/s  ETA:{eta:.0f}s",
-              end="", flush=True)
+    def drain_queue():
+        while True:
+            try:
+                code6, last_date, records, error = result_queue.get_nowait()
+                if not error and last_date:
+                    results.append((code6, last_date, records))
+                elif error:
+                    failed.append((code6, error))
+            except Exception:
+                break
 
     batch_start = perf_counter()
 
-    # 初始填充
-    for _ in range(min(MAX_WORKERS, total)):
+    for _ in range(min(max_workers, total)):
         try:
             code, start_date = next(code_iter)
             start_worker(code, start_date)
         except StopIteration:
             break
 
-    # 主循环
     while running:
+        drain_queue()
+
         to_reap = []
         now = perf_counter()
 
         for pid, (p, code, st) in running.items():
             if not p.is_alive():
                 to_reap.append((pid, False))
-            elif now - st > STOCK_TIMEOUT:
+            elif now - st > stock_timeout:
                 to_reap.append((pid, True))
 
         for pid, timed_out in to_reap:
-            reap_worker(pid, timed_out)
+            p, code, _start = running.pop(pid)
+            code6 = str(code).strip().zfill(6)
+
+            if timed_out:
+                p.kill()
+                failed.append((code6, f"超时{stock_timeout}s"))
+
+            p.join(timeout=5)
+            if p.is_alive():
+                p.kill()
+                p.join()
+
+            done_count += 1
+            elapsed = perf_counter() - batch_start
+            rate = done_count / elapsed if elapsed > 0 else 0
+            eta = (total - done_count) / rate if rate > 0 else 0
+            print(f"\r  [{done_count}/{total}] "
+                  f"成功:{len(results)} 失败:{len(failed)}  "
+                  f"{rate:.2f}只/s  ETA:{eta:.0f}s",
+                  end="", flush=True)
+
             try:
                 code, start_date = next(code_iter)
                 start_worker(code, start_date)
@@ -198,7 +239,8 @@ def process_batch(batch, output_dir, fields):
         if not to_reap:
             time.sleep(0.3)
 
-    return success, failed
+    drain_queue()
+    return results, failed
 
 
 def main():
@@ -207,67 +249,169 @@ def main():
     # ---- 加载说明文件 ----
     manifest = load_manifest()
 
-    # ---- 获取股票列表 ----
-    ak.stock_info_sh_name_code.cache_clear()
-    stocks = ak.stock_info_a_code_name()
-    stocks = stocks.rename(columns={
-        stocks.columns[0]: "证券代码",
-        stocks.columns[1]: "证券名称",
-    })
+    # ---- 检查运行模式 ----
+    retry_failed = "--retry-failed" in sys.argv
+    sync_mode = "--sync" in sys.argv
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---- 过滤：只保留 3、0、6 开头的证券代码 ----
-    valid_prefixes = {"3", "0", "6"}
-    filtered_codes = []
-    code_name_map = {}
-    skipped_prefix = 0
-    for _, row in stocks.iterrows():
-        code = row["证券代码"]
-        code6 = str(code).strip().zfill(6)
-        if code6[0] not in valid_prefixes:
-            skipped_prefix += 1
-        else:
-            filtered_codes.append(code)
-            code_name_map[code6] = row["证券名称"]
+    if sync_mode:
+        # ---- 同步模式：扫描所有CSV文件，补齐缺失日期的行情数据 ----
+        csv_files = sorted(OUTPUT_DIR.glob("*.csv"))
+        incremental = []
+        already_current = []
+        corrupt_files = []
+        code_name_map = {}
+        skipped_prefix = 0
 
-    # ---- 分类：新下载 / 增量更新 / 已是最新 ----
-    new_downloads = []      # [(code, START_DATE), ...]
-    incremental = []         # [(code, last_date_from_manifest), ...]
-    already_current = []
+        for filepath in csv_files:
+            code6 = filepath.stem
+            if not code6.isdigit() or len(code6) != 6:
+                continue
 
-    for code in filtered_codes:
-        code6 = str(code).strip().zfill(6)
-        filepath = OUTPUT_DIR / f"{code6}.csv"
+            file_last_date, record_count = get_csv_info(filepath)
+            if file_last_date is None:
+                corrupt_files.append(code6)
+                continue
 
-        if not filepath.exists():
-            new_downloads.append((code, START_DATE))
-            continue
+            stock_info = manifest.get("stocks", {}).get(code6, {})
+            code_name_map[code6] = stock_info.get("name", "")
 
-        stock_info = manifest.get("stocks", {}).get(code6)
-        if stock_info and stock_info.get("last_trade_date"):
-            last_date = stock_info["last_trade_date"]
-            if last_date >= END_DATE:
+            if file_last_date >= END_DATE:
                 already_current.append(code6)
             else:
-                incremental.append((code, last_date))
-        else:
-            # 文件存在但manifest无记录（首次运行无manifest），从文件读截止日
-            file_last_date, _ = get_csv_info(filepath)
-            if file_last_date and file_last_date >= END_DATE:
-                already_current.append(code6)
-            elif file_last_date:
-                incremental.append((code, file_last_date))
+                incremental.append((code6, file_last_date))
+
+        workers = MAX_WORKERS
+        batch_size = BATCH_SIZE
+        timeout = STOCK_TIMEOUT
+        new_downloads = []
+
+        total = len(csv_files)
+        print(f"[同步模式] 扫描到 {total} 个CSV文件")
+        print(f"  需补齐: {len(incremental)}  已最新: {len(already_current)}"
+              f"  损坏: {len(corrupt_files)}")
+        print(f"  截止日期: {END_DATE}")
+        print(f"并行: {workers}进程  每批: {batch_size}只  超时: {timeout}s")
+        print(f"批次暂停: {RESTART_SLEEP}s\n")
+
+        if corrupt_files:
+            print(f"  损坏文件(将跳过): {', '.join(corrupt_files[:20])}"
+                  f"{'...' if len(corrupt_files) > 20 else ''}\n")
+
+    elif retry_failed:
+        failed_log = OUTPUT_DIR / "failed_codes.txt"
+        if not failed_log.exists():
+            print("没有 failed_codes.txt，无法重试。请先运行一次完整下载。")
+            return
+
+        code_name_map = {}
+        incremental = []
+        already_current = []
+        new_downloads = []
+        skipped_prefix = 0
+        workers = 3          # 重试模式降低并发，避免再次被限流
+        batch_size = 100
+        timeout = 45         # 放宽超时
+
+        with open(failed_log, "r", encoding="utf-8") as f:
+            next(f)  # 跳过 header
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(",", 1)
+                code6 = parts[0].strip().zfill(6)
+                reason = parts[1] if len(parts) > 1 else ""
+
+                filepath = OUTPUT_DIR / f"{code6}.csv"
+                if not filepath.exists():
+                    new_downloads.append((code6, START_DATE))
+                    continue
+
+                stock_info = manifest.get("stocks", {}).get(code6)
+                if stock_info and stock_info.get("last_trade_date"):
+                    last_date = stock_info["last_trade_date"]
+                    if last_date >= END_DATE:
+                        already_current.append(code6)
+                    else:
+                        incremental.append((code6, last_date))
+                else:
+                    file_last_date, _ = get_csv_info(filepath)
+                    if file_last_date and file_last_date >= END_DATE:
+                        already_current.append(code6)
+                    elif file_last_date:
+                        incremental.append((code6, file_last_date))
+                    else:
+                        new_downloads.append((code6, START_DATE))
+
+        total = len(new_downloads) + len(incremental) + len(already_current)
+        print(f"[重试失败模式] 并发:{workers}  超时:{timeout}s  每批:{batch_size}")
+        print(f"  新下载:{len(new_downloads)}  增量更新:{len(incremental)}  已最新:{len(already_current)}")
+        print(f"  截止日期:{END_DATE}\n")
+    else:
+        # ---- 获取股票列表 ----
+        ak.stock_info_sh_name_code.cache_clear()
+        stocks = ak.stock_info_a_code_name()
+        stocks = stocks.rename(columns={
+            stocks.columns[0]: "证券代码",
+            stocks.columns[1]: "证券名称",
+        })
+
+        # ---- 过滤：只保留 3、0、6 开头的证券代码 ----
+        valid_prefixes = {"3", "0", "6"}
+        filtered_codes = []
+        code_name_map = {}
+        skipped_prefix = 0
+        for _, row in stocks.iterrows():
+            code = row["证券代码"]
+            code6 = str(code).strip().zfill(6)
+            if code6[0] not in valid_prefixes:
+                skipped_prefix += 1
             else:
-                # 文件损坏或为空，重新下载
+                filtered_codes.append(code)
+                code_name_map[code6] = row["证券名称"]
+
+        # ---- 分类：新下载 / 增量更新 / 已是最新 ----
+        new_downloads = []      # [(code, START_DATE), ...]
+        incremental = []         # [(code, last_date_from_manifest), ...]
+        already_current = []
+
+        for code in filtered_codes:
+            code6 = str(code).strip().zfill(6)
+            filepath = OUTPUT_DIR / f"{code6}.csv"
+
+            if not filepath.exists():
                 new_downloads.append((code, START_DATE))
+                continue
 
-    total = len(stocks)
-    print(f"总数:{total}  非3/0/6开头跳过:{skipped_prefix}")
-    print(f"  新下载:{len(new_downloads)}  增量更新:{len(incremental)}  已最新:{len(already_current)}")
-    print(f"  截止日期:{END_DATE}  复权类型:{manifest['adjust_type']}")
-    print(f"并行:{MAX_WORKERS}进程  每批:{BATCH_SIZE}只  超时:{STOCK_TIMEOUT}s")
-    print(f"批次暂停:{RESTART_SLEEP}s\n")
+            stock_info = manifest.get("stocks", {}).get(code6)
+            if stock_info and stock_info.get("last_trade_date"):
+                last_date = stock_info["last_trade_date"]
+                if last_date >= END_DATE:
+                    already_current.append(code6)
+                else:
+                    incremental.append((code, last_date))
+            else:
+                # 文件存在但manifest无记录（首次运行无manifest），从文件读截止日
+                file_last_date, _ = get_csv_info(filepath)
+                if file_last_date and file_last_date >= END_DATE:
+                    already_current.append(code6)
+                elif file_last_date:
+                    incremental.append((code, file_last_date))
+                else:
+                    # 文件损坏或为空，重新下载
+                    new_downloads.append((code, START_DATE))
+
+        total = len(stocks)
+        workers = MAX_WORKERS
+        batch_size = BATCH_SIZE
+        timeout = STOCK_TIMEOUT
+        print(f"总数:{total}  非3/0/6开头跳过:{skipped_prefix}")
+        print(f"  新下载:{len(new_downloads)}  增量更新:{len(incremental)}  已最新:{len(already_current)}")
+        print(f"  截止日期:{END_DATE}  复权类型:{manifest['adjust_type']}")
+        print(f"并行:{MAX_WORKERS}进程  每批:{BATCH_SIZE}只  超时:{STOCK_TIMEOUT}s")
+        print(f"批次暂停:{RESTART_SLEEP}s\n")
 
     todo = new_downloads + incremental
     if not todo:
@@ -285,49 +429,45 @@ def main():
         return
 
     # ---- 分批处理 ----
-    success = 0
     all_failed = []
+    new_success = 0
+    update_success = 0
 
-    for i in range(0, len(todo), BATCH_SIZE):
-        batch = todo[i:i + BATCH_SIZE]
-        batch_num = i // BATCH_SIZE + 1
-        total_batches = (len(todo) + BATCH_SIZE - 1) // BATCH_SIZE
+    for i in range(0, len(todo), batch_size):
+        batch = todo[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (len(todo) + batch_size - 1) // batch_size
 
         print(f"--- 第{batch_num}/{total_batches}批, {len(batch)}只 ---")
-        s, f = process_batch(batch, str(OUTPUT_DIR), FIELDS)
-        success += s
-        all_failed.extend(f)
+        results, batch_failed = process_batch(batch, str(OUTPUT_DIR), FIELDS,
+                                              max_workers=workers,
+                                              stock_timeout=timeout)
+        all_failed.extend(batch_failed)
+
+        batch_failed_codes = {f[0] for f in batch_failed}
+        for code6, last_date, records in results:
+            manifest["stocks"][code6] = {
+                "name": code_name_map.get(code6, ""),
+                "last_trade_date": last_date,
+                "records": records,
+                "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        for code, start_date in batch:
+            code6 = str(code).strip().zfill(6)
+            if code6 in batch_failed_codes:
+                continue
+            if start_date == START_DATE:
+                new_success += 1
+            else:
+                update_success += 1
+
+        save_manifest(manifest)
 
         remaining = len(todo) - i - len(batch)
         if remaining > 0:
             print(f"\n--- 批次完成，暂停{RESTART_SLEEP}s ---")
             time.sleep(RESTART_SLEEP)
-
-    # ---- 更新说明文件中各股票的行情截止日 ----
-    failed_set = {code for code, _ in all_failed}
-    new_success = 0
-    update_success = 0
-
-    for code, start_date in todo:
-        code6 = str(code).strip().zfill(6)
-        if code6 in failed_set:
-            continue
-        filepath = OUTPUT_DIR / f"{code6}.csv"
-        if not filepath.exists():
-            continue
-        last_date, records = get_csv_info(filepath)
-        if last_date is None:
-            continue
-        manifest["stocks"][code6] = {
-            "name": code_name_map.get(code6, ""),
-            "last_trade_date": last_date,
-            "records": records,
-            "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        if start_date == START_DATE:
-            new_success += 1
-        else:
-            update_success += 1
 
     # ---- 记录本次下载历史 ----
     manifest["download_history"].append({
@@ -353,8 +493,15 @@ def main():
     duration = perf_counter() - start_time
     print("\n" + "=" * 50)
     print(f"完成！耗时 {duration:.1f}s ({duration/60:.1f}min)")
-    print(f"总数: {total}")
-    print(f"非3/0/6开头跳过: {skipped_prefix}")
+    if sync_mode:
+        print(f"扫描文件数: {total}")
+        if corrupt_files:
+            print(f"损坏文件: {len(corrupt_files)}")
+    elif not retry_failed:
+        print(f"总数: {total}")
+        print(f"非3/0/6开头跳过: {skipped_prefix}")
+    else:
+        print(f"重试失败数: {total}")
     print(f"新下载: {new_success}")
     print(f"增量更新: {update_success}")
     print(f"已是最新: {len(already_current)}")
@@ -364,8 +511,9 @@ def main():
     print(f"输出目录: {OUTPUT_DIR}")
     print(f"说明文件: {MANIFEST_PATH}")
     print(f"复权类型: {manifest['adjust_type']} (adjustflag={manifest['adjustflag']})")
-    if success > 0:
-        print(f"平均速度: {duration/success:.1f}s/只")
+    total_success = new_success + update_success
+    if total_success > 0:
+        print(f"平均速度: {duration/total_success:.1f}s/只")
     print("=" * 50)
 
 
