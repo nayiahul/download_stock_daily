@@ -4,8 +4,9 @@
 手动进程池 + 真超时kill，分批重启。
 
 模式:
-  python download_a_stock_daily.py            # 普通模式：从akshare取股票列表，新下载+增量更新
-  python download_a_stock_daily.py --sync     # 同步模式：扫描所有CSV文件最新日期，补齐缺失
+  python download_a_stock_daily.py                 # 普通模式：从akshare取股票列表，新下载+增量更新
+  python download_a_stock_daily.py --sync          # 同步模式：扫描CSV最新日期，补齐缺失
+  python download_a_stock_daily.py --sync --end-date 2026-06-02  # 指定截止日
   python download_a_stock_daily.py --retry-failed  # 重试模式：重试failed_codes.txt中的失败项
 """
 
@@ -23,7 +24,14 @@ import pandas as pd
 # ============================================================
 OUTPUT_DIR = Path("/Users/nayiahlu/Desktop/stocks")
 START_DATE = "2021-01-01"
-END_DATE = time.strftime("%Y-%m-%d")
+
+def _parse_end_date():
+    for i, arg in enumerate(sys.argv):
+        if arg == "--end-date" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return time.strftime("%Y-%m-%d")
+
+END_DATE = _parse_end_date()
 MANIFEST_PATH = OUTPUT_DIR / "manifest.json"
 MAX_WORKERS = 6         # 并行进程数
 BATCH_SIZE = 200        # 每批数量，完成后重启连接池
@@ -118,18 +126,20 @@ def download_one(code, output_dir, start_date, end_date, fields, result_queue):
     try:
         data_list = _try_query(bs_code, fields, start_date, end_date)
 
-        # 增量更新返回空：可能是限流，退避重试1次
+        # 增量更新返回空：大概率限流，退避重试（最多3次）
         if not data_list and is_update:
-            time.sleep(random.uniform(2, 5))
-            data_list = _try_query(bs_code, fields, start_date, end_date)
+            for retry in range(3):
+                delay = random.uniform(3, 8) * (retry + 1)
+                time.sleep(delay)
+                data_list = _try_query(bs_code, fields, start_date, end_date)
+                if data_list:
+                    break
 
         if not data_list:
             if is_update:
-                # 已有CSV数据完好，无新数据不算失败
                 last_date, records = _read_existing_stats(filepath)
                 result_queue.put((code6, last_date, records, ""))
             else:
-                # 新下载确实无数据
                 result_queue.put((code6, None, 0, "无数据"))
             return
 
